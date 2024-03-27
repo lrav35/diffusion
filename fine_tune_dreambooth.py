@@ -1,21 +1,63 @@
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
+import torch
 from accelerate.utils import ProjectConfiguration, set_seed
 from accelerate import Accelerator
 from transformers import PreTrainedTokenizer, CLIPTokenizer, CLIPTextModel
 from pathlib import Path
 from torchvision import transforms
-from PIL import Image
+from PIL import Image, ImageDraw
 from os import makedirs
 import bitsandbytes as bnb
 import itertools
 import argparse
+import random
+import numpy as np
+import math
 
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
     UNet2DConditionModel,
 )
+from diffusers.optimization import get_scheduler
+
+def random_mask(shape, ratio=1, mask_full_image=False):
+    mask = Image.new("L", shape, 0)
+    draw = ImageDraw.Draw(mask)
+    size = (random.randint(0, int(shape[0] * ratio)), random.randint(0, int(shape[1] * ratio)))
+    limits = (shape[0] - size[0] // 2, shape[1] - size[1] // 2)
+    center = (random.randint(size[0] // 2, limits[0]), random.randint(size[1] // 2, limits[1]))
+    draw_type = random.randint(0, 1)
+    if draw_type == 0 or mask_full_image:
+        draw.rectangle(
+            (center[0] - size[0] // 2, center[1] - size[1] // 2, center[0] + size[0] // 2, center[1] + size[1] // 2),
+            fill=255,
+        )
+    else:
+        draw.ellipse(
+            (center[0] - size[0] // 2, center[1] - size[1] // 2, center[0] + size[0] // 2, center[1] + size[1] // 2),
+            fill=255,
+        )
+
+    return mask
+
+def prepare_mask_and_masked_image(image, mask):
+    image = np.array(image.convert("RGB"))
+    image = image[None].transpose(0, 3, 1, 2)
+    image = torch.from_numpy(image).to(dtype=torch.float32) / 127.5 - 1.0
+
+    mask = np.array(mask.convert("L"))
+    mask = mask.astype(np.float32) / 255.0
+    mask = mask[None, None]
+    mask[mask < 0.5] = 0
+    mask[mask >= 0.5] = 1
+    mask = torch.from_numpy(mask)
+
+    masked_image = image * (mask < 0.5)
+
+    return mask, masked_image
+
 
 
 class DreamBoothDataset(Dataset):
@@ -130,6 +172,7 @@ def parse_args():
 # !accelerate launch fine_tune_dreambooth.py \
 #     --prompt="insert prompt here"
 #     --input_data_dir="images/"
+#     --max_training_steps=500
     
 def main():
     args = parse_args()
@@ -193,5 +236,66 @@ def main():
         data_root=args.input_data_dir,
         prompt=args.prompt,
         tokenizer=tokenizer
+   )
+
+    def _collate_fn(examples):
+        inputs_id = [example["input_prompt_ids"] for example in examples]
+        pixel_values = [example["instance_images"] for example in examples]
+
+        masks = []
+        masked_images = []
+        for example in examples:
+            pil_image = example["PIL_images"]
+            # generate a random mask
+            mask = random_mask(pil_image.size, 1, False)
+            # prepare mask and masked image
+            mask, masked_image = prepare_mask_and_masked_image(pil_image, mask)
+
+            masks.append(mask)
+            masked_images.append(masked_image)
+
+        pixel_values = torch.stack(pixel_values)
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+        input_ids = tokenizer.pad({"input_ids": input_ids}, padding=True, return_tensors="pt").input_ids
+        masks = torch.stack(masks)
+        masked_images = torch.stack(masked_images)
+        batch = {"input_ids": input_ids, "pixel_values": pixel_values, "masks": masks, "masked_images": masked_images}
+        return batch
+    
+    train_dataloader = DataLoader(
+        train_dataset, batch_size=1, shuffle=True, collate_fn=_collate_fn
     )
 
+    lr_scheduler = get_scheduler(
+        "constant",
+        optimizer=optimizer,
+        num_warmup_steps=0,
+        num_training_steps=args.max_training_steps*accelerator.num_processes
+    )
+
+    unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+    )
+
+    accelerator.register_for_checkpointing(lr_scheduler)
+
+    weight_dtype = torch.float16
+    # Move text_encode and vae to gpu.
+    # For mixed precision training we cast the text_encoder and vae weights to half-precision
+    # as these models are only used for inference, keeping weights in full precision is not required.
+    vae.to(accelerator.device, dtype=weight_dtype)
+
+    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    gradient_accumulation_steps=2
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / gradient_accumulation_steps)
+
+    # Afterwards we recalculate our number of training epochs
+    num_train_epochs = math.ceil(args.max_training_steps / num_update_steps_per_epoch)
+
+    # We need to initialize the trackers we use, and also store our configuration.
+    # The trackers initializes automatically on the main process.
+    if accelerator.is_main_process:
+        accelerator.init_trackers("dreambooth", config=vars(args)) 
+
+    #### TRAIN #####
