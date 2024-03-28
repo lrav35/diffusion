@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch
 from accelerate.utils import ProjectConfiguration, set_seed
 from accelerate import Accelerator
-from accelerate.logging import get_logging
+from accelerate.logging import get_logger
 from transformers import PreTrainedTokenizer, CLIPTokenizer, CLIPTextModel
 from pathlib import Path
 from torchvision import transforms
@@ -26,7 +26,7 @@ from diffusers import (
 )
 from diffusers.optimization import get_scheduler
 
-logger = get_logging(__name__)
+logger = get_logger(__name__)
 
 def random_mask(shape, ratio=1, mask_full_image=False):
     mask = Image.new("L", shape, 0)
@@ -154,6 +154,18 @@ def parse_args():
         required=True,
         help="directory where the trainging data is stored",
     )
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        required=True,
+        help="maximum number of training steps in any given run",
+    )
+    parser.add_argument(
+        "--train_batch_size",
+        type=int,
+        required=True,
+        help="batch size of training run",
+    )
     args = parser.parse_args()
 
 
@@ -175,11 +187,11 @@ def parse_args():
 #     --seed="0"
     
 
-# !accelerate launch fine_tune_dreambooth.py \
-#     --prompt="insert prompt here"
-#     --input_data_dir="images/"
-#     --max_training_steps=500
-#     --train_batch_size=1
+# accelerate launch fine_tune_dreambooth.py \
+#     --prompt="insert prompt here" \
+#     --input_data_dir="images/" \
+#     --max_train_steps=500 \
+#     --train_batch_size=1 \
     
 def main():
     args = parse_args()
@@ -278,7 +290,7 @@ def main():
         "constant",
         optimizer=optimizer,
         num_warmup_steps=0,
-        num_training_steps=args.max_training_steps*accelerator.num_processes
+        num_training_steps=args.max_train_steps*accelerator.num_processes
     )
 
     unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -298,7 +310,7 @@ def main():
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / gradient_accumulation_steps)
 
     # Afterwards we recalculate our number of training epochs
-    num_train_epochs = math.ceil(args.max_training_steps / num_update_steps_per_epoch)
+    num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -421,10 +433,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
