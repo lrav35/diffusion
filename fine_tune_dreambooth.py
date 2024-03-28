@@ -1,26 +1,32 @@
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
+import torch.nn.functional as F
 import torch
 from accelerate.utils import ProjectConfiguration, set_seed
 from accelerate import Accelerator
+from accelerate.logging import get_logging
 from transformers import PreTrainedTokenizer, CLIPTokenizer, CLIPTextModel
 from pathlib import Path
 from torchvision import transforms
 from PIL import Image, ImageDraw
-from os import makedirs
+from os import makedirs, path
 import bitsandbytes as bnb
 import itertools
 import argparse
 import random
 import numpy as np
 import math
+import tqdm
 
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
     UNet2DConditionModel,
+    StableDiffusionPipeline
 )
 from diffusers.optimization import get_scheduler
+
+logger = get_logging(__name__)
 
 def random_mask(shape, ratio=1, mask_full_image=False):
     mask = Image.new("L", shape, 0)
@@ -173,6 +179,7 @@ def parse_args():
 #     --prompt="insert prompt here"
 #     --input_data_dir="images/"
 #     --max_training_steps=500
+#     --train_batch_size=1
     
 def main():
     args = parse_args()
@@ -264,7 +271,7 @@ def main():
         return batch
     
     train_dataloader = DataLoader(
-        train_dataset, batch_size=1, shuffle=True, collate_fn=_collate_fn
+        train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=_collate_fn
     )
 
     lr_scheduler = get_scheduler(
@@ -299,3 +306,125 @@ def main():
         accelerator.init_trackers("dreambooth", config=vars(args)) 
 
     #### TRAIN #####
+    total_batch_size = args.train_batch_size * accelerator.num_processes * 2 # batch * processes * grad accum
+
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
+    logger.info(f"  Num Epochs = {num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {2}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    global_step = 0
+    first_epoch = 0
+
+    progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar.set_description("Steps")
+
+    for epoch in range(first_epoch, num_train_epochs):
+        unet.train()
+        for step, batch in enumerate(train_dataloader):
+            with accelerator.accumulate(unet):
+                # images -> latent space
+                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
+
+                # masks -> latent space
+                latent_masks = vae.encode(
+                    batch["masked_images"].reshape(batch["pixel_values"].shape).to(dtype=weight_dtype)
+                ).latent_dist.sample()
+                latent_masks = latent_masks * vae.config.scaling_factor
+
+                masks = batch["masks"]
+                # resize masks to shape of latents as we concatentate the masks to the latents
+                new_res = 512 // 8
+                mask = torch.stack(
+                    [
+                        F.interpolate(mask, size=(new_res, new_res)) for mask in masks
+                    ]
+                )
+                mask = mask.reshape(-1, 1, new_res, new_res)
+
+                # sample noise to add to latents (forward pass)
+                noise = torch.randn_like(latents)
+                bsz = latents.shape[0]
+                # sample random timestep (forward pass)
+                timesteps = torch.randint(0, noise_sched.config.num_train_steps, (bsz,), device=latents.device)
+                timesteps = timesteps.long()
+
+                # add this random noise to our latents
+                noisy_latents = noise_sched.add_noise(latents, noise, timesteps)
+
+                # concat the noisy latents with the mask and unmasked latents
+                latent_model_input = torch.cat([noisy_latents, masks, latent_masks], dim=1)
+
+                # get text embedding for conditioning (CLIP)
+                encoder_h_states = text_encoder(batch["input_ids"])[0]
+
+                # make noise residual prediction
+                noise_pred = unet(latent_model_input, timesteps, encoder_h_states).sample
+
+                # Get the target for loss depending on the prediction type
+                if noise_sched.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_sched.config.prediction_type == "v_prediction":
+                    target = noise_sched.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_sched.config.prediction_type}")
+                
+                # LOSS
+                loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = (
+                        itertools.chain(unet.parameters(), text_encoder.parameters())
+                        if args.train_text_encoder
+                        else unet.parameters()
+                    )
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+            
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+
+                if global_step % 500 == 0:
+                    if accelerator.is_main_process:
+                        save_path = path.join(log_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"saved state to {save_path}")
+            
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
+            accelerator.log(logs, step=global_step)
+
+            if global_step >= args.max_train_steps:
+                break
+
+        accelerator.wait_for_everyone()
+    
+    # Create the pipeline using using the trained modules and save it.
+    if accelerator.is_main_process:
+        pipeline = StableDiffusionPipeline.from_pretrained(
+            model_name,
+            unet=accelerator.unwrap_model(unet),
+            text_encoder=accelerator.unwrap_model(text_encoder),
+        )
+        pipeline.save_pretrained(args.log_dir)
+
+    accelerator.end_training()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
