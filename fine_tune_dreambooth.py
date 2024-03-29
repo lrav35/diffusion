@@ -10,13 +10,14 @@ from pathlib import Path
 from torchvision import transforms
 from PIL import Image, ImageDraw
 from os import makedirs, path
+from tqdm.auto import tqdm
 import bitsandbytes as bnb
 import itertools
 import argparse
 import random
 import numpy as np
 import math
-import tqdm
+
 
 from diffusers import (
     AutoencoderKL,
@@ -108,16 +109,16 @@ class DreamBoothDataset(Dataset):
     
     def __getitem__(self, index: int) -> dict:
         example = {}
-        instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
+        instance_image = Image.open(self.instance_image_path[index % self.num_images])
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
-        instance_image = self.image_transforms_resize_and_crop(instance_image)
+        instance_image = self.image_transforms_resize_crop(instance_image)
 
         example["PIL_images"] = instance_image
         example["instance_images"] = self.image_transforms(instance_image)
 
-        example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_prompt,
+        example["input_prompt_ids"] = self.tokenizer(
+            self.prompt,
             padding="do_not_pad",
             truncation=True,
             max_length=self.tokenizer.model_max_length,
@@ -267,7 +268,7 @@ def main():
    )
 
     def _collate_fn(examples):
-        inputs_id = [example["input_prompt_ids"] for example in examples]
+        input_ids = [example["input_prompt_ids"] for example in examples]
         pixel_values = [example["instance_images"] for example in examples]
 
         masks = []
@@ -371,14 +372,14 @@ def main():
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
                 # sample random timestep (forward pass)
-                timesteps = torch.randint(0, noise_sched.config.num_train_steps, (bsz,), device=latents.device)
+                timesteps = torch.randint(0, noise_sched.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
                 # add this random noise to our latents
                 noisy_latents = noise_sched.add_noise(latents, noise, timesteps)
 
                 # concat the noisy latents with the mask and unmasked latents
-                latent_model_input = torch.cat([noisy_latents, masks, latent_masks], dim=1)
+                latent_model_input = torch.cat([noisy_latents, mask, latent_masks], dim=1)
 
                 # get text embedding for conditioning (CLIP)
                 encoder_h_states = text_encoder(batch["input_ids"])[0]
@@ -401,10 +402,8 @@ def main():
                 if accelerator.sync_gradients:
                     params_to_clip = (
                         itertools.chain(unet.parameters(), text_encoder.parameters())
-                        if args.train_text_encoder
-                        else unet.parameters()
                     )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    accelerator.clip_grad_norm_(params_to_clip, 1.0)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -435,7 +434,7 @@ def main():
             unet=accelerator.unwrap_model(unet),
             text_encoder=accelerator.unwrap_model(text_encoder),
         )
-        pipeline.save_pretrained(args.log_dir)
+        pipeline.save_pretrained(log_dir)
 
     accelerator.end_training()
 
