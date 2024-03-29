@@ -166,7 +166,16 @@ def parse_args():
         required=True,
         help="batch size of training run",
     )
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default="fp16",
+        help="we need to use fp16 bc we are VRAM bound training on colab T4 GPUs"
+    )
     args = parser.parse_args()
+    
+    return args
+
 
 
 # !accelerate launch train_dreambooth_inpaint.py \
@@ -206,7 +215,7 @@ def main():
 
     accelerator = Accelerator(
         gradient_accumulation_steps=2,
-        mixed_precision="fp16",
+        mixed_precision=args.mixed_precision,
         log_with="tensorboard",
         project_config=project_config
     )
