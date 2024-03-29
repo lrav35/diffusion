@@ -211,7 +211,7 @@ def main():
         project_config=project_config
     )
 
-    set_seed("42")
+    set_seed(42)
 
     # Handle the repository creation
     if accelerator.is_main_process:
