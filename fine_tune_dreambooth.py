@@ -204,6 +204,9 @@ def parse_args():
 #     --train_batch_size=1 \
     
 def main():
+    """
+    training code for dreambooth diffusion model. Code largely taken from diffusers examples.
+    """
     args = parse_args()
 
     model_name = "runwayml/stable-diffusion-inpainting"
