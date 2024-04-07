@@ -11,6 +11,7 @@ from torchvision import transforms
 from PIL import Image, ImageDraw
 from os import makedirs, path
 from tqdm.auto import tqdm
+from datetime import datetime
 import bitsandbytes as bnb
 import itertools
 import argparse
@@ -19,7 +20,6 @@ import numpy as np
 import math
 import wandb
 import uuid
-import datetime
 
 
 from diffusers import (
@@ -318,7 +318,7 @@ def main():
     #### TRAIN #####
     
     wandb.init(
-        project=args.project_name,
+        project="diffusion-inpainting",
         name=run_id,
         config={
             "model_name": args.project_name,
