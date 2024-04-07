@@ -17,6 +17,9 @@ import argparse
 import random
 import numpy as np
 import math
+import wandb
+import uuid
+import datetime
 
 
 from diffusers import (
@@ -122,7 +125,7 @@ class DreamBoothDataset(Dataset):
             padding="do_not_pad",
             truncation=True,
             max_length=self.tokenizer.model_max_length,
-        ).input_ids
+      ).input_ids
 
         return example
     
@@ -171,7 +174,13 @@ def parse_args():
         "--mixed_precision",
         type=str,
         default="fp16",
-        help="we need to use fp16 bc we are VRAM bound training on colab T4 GPUs"
+        help="we need to use fp16 bc we are VRAM bound training on colab"
+    )
+    parser.add_argument(
+        "--project-name",
+        type=str,
+        required=True,
+        help="name of the final save directory and project name in wandb"
     )
     args = parser.parse_args()
     
@@ -185,7 +194,9 @@ def main():
 
     model_name = "runwayml/stable-diffusion-inpainting"
 
-    log_dir = Path("diffusion-inpainting")
+    log_dir = Path(args.project_name)
+
+    run_id = uuid.uuid4()
 
     project_config = ProjectConfiguration(
         project_dir=log_dir, logging_dir=log_dir
@@ -305,6 +316,19 @@ def main():
         accelerator.init_trackers("dreambooth", config=vars(args)) 
 
     #### TRAIN #####
+    
+    wandb.init(
+        project=args.project_name,
+        name=run_id,
+        config={
+            "model_name": args.project_name,
+            "run_id": run_id,
+            "date": datetime.now().strftime("%Y-%m-%d-%I_%M_%S_%p"),
+            "epochs": num_train_epochs
+        }
+
+    )
+
     total_batch_size = args.train_batch_size * accelerator.num_processes * 2 # batch * processes * grad accum
 
     logger.info("***** Running training *****")
@@ -395,7 +419,18 @@ def main():
                         accelerator.save_state(save_path)
                         logger.info(f"saved state to {save_path}")
             
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            loss_tensor = loss.detach().item()
+            
+            logs = {"loss": loss_tensor, "lr": lr_scheduler.get_last_lr()[0]}
+
+            wandb.log(
+                {
+                    "current_loss": loss_tensor,
+                    "current_epoch": epoch,
+                    "learning_rate": lr_scheduler.get_last_lr()[0],
+                }
+            )
+
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
